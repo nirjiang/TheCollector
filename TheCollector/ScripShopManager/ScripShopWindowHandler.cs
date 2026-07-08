@@ -1,0 +1,247 @@
+﻿
+using System;
+using ECommons;
+using ValueType = FFXIVClientStructs.FFXIV.Component.GUI.AtkValueType;
+using FFXIVClientStructs.FFXIV.Component.GUI;
+using TheCollector.Utility;
+using FFXIVClientStructs.FFXIV.Client.Game;
+using FFXIVClientStructs.FFXIV.Client.UI;
+namespace TheCollector.ScripShopManager;
+
+public unsafe class ScripShopWindowHandler
+{
+    private readonly PlogonLog _log;
+    private readonly Configuration _configuration;
+    private bool _forceSearchActive;
+    private bool _waitingForTabChange;
+
+    private uint _targetItemId;
+    private int _targetAmount;
+
+    private int _forceSubPage;
+    private int _forceSubPageMax;
+
+    private DateTime _cooldownUntil;
+
+    private const int DropdownNodeId = 9;
+    private TimeSpan UiDelay => TimeSpan.FromMilliseconds(_configuration.GetUiDelayMs(AddonDelays.ScripShop));
+    public ScripShopWindowHandler(PlogonLog log, Configuration configuration)
+    {
+        _log = log;
+        _configuration = configuration;
+    }
+    public void OpenShop()
+    {
+        if (Addons.TryGet("SelectIconString", out var addon))
+        {
+            var openShop = stackalloc AtkValue[]
+            {
+                new() { Type = ValueType.Int, Int = 0 }
+            };
+            addon->FireCallback(1, openShop);
+        }
+    }
+    public void SelectPage(int page)
+    {
+        if (Addons.TryGet("InclusionShop", out var addon))
+        {
+            var selectPage = stackalloc AtkValue[]
+            {
+                new() { Type = ValueType.Int, Int = 12 },
+                new() { Type = ValueType.UInt, UInt = (uint)page }
+            };
+            for (int i = 0; i < addon->UldManager.NodeListCount; i++)
+            {
+                var node = addon->UldManager.NodeList[i];
+                if (node->Type == (NodeType)1015 && node->NodeId == 7)
+                {
+                    var compNode = node->GetAsAtkComponentNode();
+                    if (compNode == null || compNode->Component == null) continue;
+
+                    var dropDown = compNode->GetAsAtkComponentDropdownList();
+                    dropDown->SelectItem(page);
+                    addon->FireCallback(2, selectPage);
+                }
+            }
+        }
+    }
+
+    public StepResult SelectItem(uint itemId, int amount)
+    {
+        if (DateTime.UtcNow < _cooldownUntil)
+            return StepResult.Continue();
+
+        if (!Addons.TryGet("InclusionShop", out var addon) || addon == null)
+        {
+            ResetForceSearch();
+            return StepResult.Fail("InclusionShop not open");
+        }
+
+        if (!_forceSearchActive || _targetItemId != itemId || _targetAmount != amount)
+        {
+            _forceSearchActive = true;
+            _waitingForTabChange = false;
+
+            _targetItemId = itemId;
+            _targetAmount = amount;
+
+            _forceSubPage = 1;
+            _forceSubPageMax = 0;
+
+            _cooldownUntil = DateTime.MinValue;
+        }
+
+        if (TrySelectItemInCurrentTab(addon, _targetItemId, _targetAmount))
+        {
+            ResetForceSearch();
+            return StepResult.Success();
+        }
+
+        if (_forceSubPageMax == 0 && !TryGetDropdownList(addon, out _forceSubPageMax))
+        {
+            ResetForceSearch();
+            return StepResult.Fail("Could not read subpage dropdown");
+        }
+
+        if (_forceSubPage > _forceSubPageMax)
+        {
+            var id = _targetItemId;
+            ResetForceSearch();
+            return StepResult.Fail($"Item {id} not found in any subpage");
+        }
+
+        if (!_waitingForTabChange)
+        {
+            SelectSubPage(_forceSubPage);
+            _waitingForTabChange = true;
+            _cooldownUntil = DateTime.UtcNow + UiDelay;
+            return StepResult.Continue();
+        }
+
+        _forceSubPage++;
+        _waitingForTabChange = false;
+        _cooldownUntil = DateTime.UtcNow + TimeSpan.FromMilliseconds(50);
+        return StepResult.Continue();
+    }
+    private void ResetForceSearch()
+    {
+        _forceSearchActive = false;
+        _waitingForTabChange = false;
+
+        _targetItemId = 0;
+        _targetAmount = 0;
+
+        _forceSubPage = 0;
+        _forceSubPageMax = 0;
+
+        _cooldownUntil = DateTime.MinValue;
+    }
+
+
+    private bool TryGetDropdownList(AtkUnitBase* addon, out int listLength)
+    {
+        listLength = 0;
+
+        for (int i = 0; i < addon->UldManager.NodeListCount; i++)
+        {
+            var node = addon->UldManager.NodeList[i];
+            if (node->Type != (NodeType)1015 || node->NodeId != DropdownNodeId)
+                continue;
+
+            var compNode = node->GetAsAtkComponentNode();
+            if (compNode == null || compNode->Component == null)
+                return false;
+
+            var dropDown = compNode->GetAsAtkComponentDropdownList();
+            if (dropDown == null || dropDown->List == null)
+                return false;
+
+            listLength = dropDown->List->ListLength;
+            return true;
+
+        }
+        return false;
+    }
+
+    public void SelectSubPage(int subPage)
+    {
+        if (Addons.TryGet("InclusionShop", out var addon))
+        {
+            var selectSubPage = stackalloc AtkValue[]
+            {
+            new() { Type = ValueType.Int, Int = 13 },
+            new() { Type = ValueType.UInt, UInt = (uint)subPage }
+        };
+            addon->FireCallback(2, selectSubPage);
+        }
+    }
+    private bool TrySelectItemInCurrentTab(AtkUnitBase* addon, uint itemId, int amount)
+    {
+        var shop = new ECommons.UIHelpers.AddonMasterImplementations.AddonMaster.InclusionShop(addon);
+        var shopItems = shop.ShopItems;
+        var index = -1;
+        for (int i = 0; i < shopItems.Length; i++)
+        {
+            if (shopItems[i].ItemId == itemId)
+            {
+                index = i;
+                _log.Debug($"Index: {index}");
+                break;
+            }
+        }
+
+        if (index == -1)
+            return false;
+
+        var selectItem = stackalloc AtkValue[]
+        {
+        new() { Type = ValueType.Int,  Int  = 14 },
+        new() { Type = ValueType.UInt, UInt = (uint)index },
+        new() { Type = ValueType.UInt, UInt = (uint)amount }
+    };
+        addon->FireCallback(3, selectItem);
+        return true;
+    }
+
+
+    public void ConfirmPurchaseDialog()
+    {
+        if (Addons.TryGet("ShopExchangeItemDialog", out var shopAddon))
+        {
+            var purchaseItem = stackalloc AtkValue[]
+            {
+                new() { Type = ValueType.Int, Int = 0 }
+            };
+            shopAddon->FireCallback(1, purchaseItem);
+            shopAddon->Close(true);
+        }
+    }
+
+    public bool ConfirmYesNo()
+    {
+        if (Addons.TryGet("SelectYesno", out var yesnoAddon))
+        {
+            var addonMaster = new ECommons.UIHelpers.AddonMasterImplementations.AddonMaster.SelectYesno(yesnoAddon);
+            addonMaster.Yes();
+            return true;
+        }
+        return false;
+    }
+
+    public bool TryGetScripCount(uint currencyItemId, out uint count)
+    {
+        count = 0;
+        if (!Addons.TryGet("InclusionShop", out var addon))
+            return false;
+        var cur = CurrencyManager.Instance();
+        count = cur->GetItemCount(currencyItemId);
+        return true;
+    }
+    public void CloseShop()
+    {
+        if (Addons.TryGet("InclusionShop", out var addon))
+        {
+            addon->Close(true);
+        }
+    }
+}
